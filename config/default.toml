@@ -13,8 +13,8 @@ rounds_missed_threshold = 2
 # BEST PRATICES: use a key that is only capable of calling eosio::regproducer
 regproducer_key = '5K9TQZDL7bagZLKLFU7VBtHPcSmZPRCqS14hZWsp56C5whBpQbT'
 
-# The producer account to monitor and sign with
-producer_account = 'producer'
+# The producer accounts to monitor and sign with
+producer_accounts = ['producer']
 
 # The producer account permission used to sign with
 producer_permission = 'producer'
