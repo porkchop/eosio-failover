@@ -3,10 +3,10 @@ import * as config from 'config'
 
 import { SlackWebhook } from './slack-webhook'
 
-const slackOptions:any = config.has('slack') ? config.get('slack') : {}
+const slackOptions: any = config.has('slack') ? config.get('slack') : {}
 export const slack = new SlackWebhook(slackOptions.url, slackOptions.channel, slackOptions.chain)
 
-const streams:any = (config.get('log') as any[]).map(({level, out}) => {
+const streams: any = (config.get('log') as any[]).map(({level, out}) => {
     if (out === 'stdout') {
         return {level, stream: process.stdout}
     } else if (out === 'stderr') {

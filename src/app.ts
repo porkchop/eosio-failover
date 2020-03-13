@@ -1,8 +1,8 @@
 import * as config from 'config'
+import { Api, JsonRpc } from 'eosjs'
+import { JsSignatureProvider } from 'eosjs/dist/eosjs-jssig'
 import * as _ from 'lodash'
 import { logger, slack } from './common'
-import { JsonRpc, Api } from 'eosjs'
-import { JsSignatureProvider } from 'eosjs/dist/eosjs-jssig'
 import version from './version'
 
 const fetch = require('node-fetch')
@@ -19,19 +19,19 @@ const eos = new Api({
   textEncoder,
 })
 
-const producer_accounts:any = config.get('producer_accounts')
-const producer_permission:string = config.get('producer_permission')
-const producer_website:string = config.get('producer_website')
-const producer_location:number = config.get('producer_location')
-let producer_signing_pubkeys_nodes:any = config.get('producer_signing_pubkeys_nodes')
+const producer_accounts: string[] = config.get('producer_accounts')
+const producer_permission: string = config.get('producer_permission')
+const producer_website: string = config.get('producer_website')
+const producer_location: number = config.get('producer_location')
+let producer_signing_pubkeys_nodes: string[][] = (config.get('producer_signing_pubkeys_nodes') as string[][]).slice()
 
-const rounds_missed_threshold:number = config.has('rounds_missed_threshold') ? config.get('rounds_missed_threshold') : 1
-const total_producers:number = config.has('total_producers') ? config.get('total_producers') : 21
-const round_timer:number = (config.has('round_timer') ? Number(config.get('round_timer')) : 126) * 1000
+const rounds_missed_threshold: number = config.has('rounds_missed_threshold') ? config.get('rounds_missed_threshold') : 1
+const total_producers: number = config.has('total_producers') ? config.get('total_producers') : 21
+const round_timer: number = (config.has('round_timer') ? Number(config.get('round_timer')) : 126) * 1000
 
 let stuck_counter = 0
 
-const producersTracking:any = _.map(producer_accounts, (producer_account) => {
+const producersTracking: any = _.map(producer_accounts, (producer_account) => {
   return {
     rounds_missed: 0,
     last_unpaid: -1,
@@ -99,9 +99,9 @@ export function incomingSigningKeyChange(
     const schedule_for_producer = _.find(schedule[state].producers, { producer_name: producerTracking.producer_account })
     if (schedule_for_producer) {
       const scheduled_new_key = schedule_for_producer.block_signing_key
-      if (producer_signing_pubkeys.includes(scheduled_new_key)) {
-        logger.debug({ producer_signing_pubkeys, current_signing_key }, `removing ${state} producer key from potential failover keys`)
-        producer_signing_pubkeys = _.filter(producer_signing_pubkeys, (k) => k !== scheduled_new_key);
+      if (undefined !== producer_signing_pubkeys_nodes.find((producer_signing_pubkeys) => producer_signing_pubkeys.includes(scheduled_new_key))) {
+        logger.debug({ producer_signing_pubkeys_nodes, current_signing_key }, `removing ${state} producer key from potential failover keys`)
+        producer_signing_pubkeys_nodes = _.filter(producer_signing_pubkeys_nodes, (producer_signing_pubkeys) => !producer_signing_pubkeys.includes(scheduled_new_key))
       }
       if (scheduled_new_key !== current_signing_key) {
         logger.debug({ scheduled_new_key, current_signing_key }, `${state} schedule change found, awaiting...`)
@@ -133,29 +133,7 @@ export async function failover(producer_account: string, next_signing_key: strin
   }, {
     blocksBehind: 3,
     expireSeconds: 60,
-  });
-  return result.transaction_id
-}
-
-export async function unregister(): Promise<string> {
-  const result = await eos.transact({
-    actions: [
-      {
-        authorization: [{
-          actor: producer_account,
-          permission: producer_permission,
-        }],
-        account: 'eosio',
-        name: 'unregprod',
-        data: {
-          producer: producer_account
-        },
-      }
-    ]
-  }, {
-    blocksBehind: 3,
-    expireSeconds: 60,
-  });
+  })
   return result.transaction_id
 }
 
@@ -163,24 +141,24 @@ async function checkProducer(producerTracking: any, state: any, producers: any, 
   // Get the target producer from the active producers
   const producer = _.find(producers, { owner: producerTracking.producer_account })
   if (!producer) {
-    logger.debug({ producerTracking.producer_account }, `producer not an active producer`)
+    logger.debug({ producer_account: producerTracking.producer_account }, `producer not an active producer`)
     return
   }
 
   // Get the target producer within the schedule
   const current_schedule = _.find(schedule.active.producers, { producer_name: producerTracking.producer_account })
   if (!current_schedule) {
-    logger.debug({ producerTracking.producer_account }, `producer not in schedule`)
+    logger.debug({ producer_account: producerTracking.producer_account }, `producer not in schedule`)
     return
   }
 
   // Get the current signing key from the active schedule
-  const current_signing_key = current_schedule.block_signing_key;
+  const current_signing_key = current_schedule.block_signing_key
 
   // Ensure the current key in use is not a potential key to failover to
-  if (_.any(producer_signing_pubkeys_nodes, producer_signing_pubkeys => producer_signing_pubkeys.includes(current_signing_key))) {
-    logger.debug({ producer_signing_pubkeys_nodes, current_signing_key }, "removing current signing key set from potential failover keys")
-    producer_signing_pubkeys_nodes = _.filter(producer_signing_pubkeys_nodes, (producer_signing_pubkeys) => !producer_signing_pubkeys.includes(current_signing_key));
+  if (_.find(producer_signing_pubkeys_nodes, (producer_signing_pubkeys) => producer_signing_pubkeys.includes(current_signing_key))) {
+    logger.debug({ producer_signing_pubkeys_nodes, current_signing_key }, 'removing current signing key set from potential failover keys')
+    producer_signing_pubkeys_nodes = _.filter(producer_signing_pubkeys_nodes, (producer_signing_pubkeys) => !producer_signing_pubkeys.includes(current_signing_key))
   }
 
   // If a key change is in progress, do not proceed
@@ -189,22 +167,22 @@ async function checkProducer(producerTracking: any, state: any, producers: any, 
     || incomingSigningKeyChange(producerTracking, current_signing_key, schedule, 'pending')
   ) {
     // reset the last paid value to reinitialize and prevent secondary trigger under certain circumstances
-    last_unpaid = -1
+    producerTracking.last_unpaid = -1
     slack.send(`🕒 signing key changes pending in schedule`)
     return
   }
 
-  let { unpaid_blocks } = producer
-  logger.debug({ unpaid_blocks, last_unpaid: producerTracking.last_unpaid }, "unpaid block states")
+  const { unpaid_blocks } = producer
+  logger.debug({ unpaid_blocks, last_unpaid: producerTracking.last_unpaid }, 'unpaid block states')
 
   if (producerTracking.last_unpaid === -1) {
     // If this is the first run (-1), just initialize and don't proceed
-    logger.info({ unpaid_blocks }, "initializing unpaid block count on first call")
+    logger.info({ unpaid_blocks }, 'initializing unpaid block count on first call')
     producerTracking.last_unpaid = unpaid_blocks
     return
   } else if (unpaid_blocks < producerTracking.last_unpaid) {
     // If the new unpaid is less than the old, the BP has claimed and this value needs to be reset
-    logger.debug({ last_unpaid: producerTracking.last_unpaid, unpaid_blocks }, "resetting unpaid blocks, encountered reward claim")
+    logger.debug({ last_unpaid: producerTracking.last_unpaid, unpaid_blocks }, 'resetting unpaid blocks, encountered reward claim')
     producerTracking.last_unpaid = unpaid_blocks
     return
   } else if (unpaid_blocks > producerTracking.last_unpaid) {
@@ -231,19 +209,19 @@ async function checkProducer(producerTracking: any, state: any, producers: any, 
 export async function check() {
   // Retrieve the current state of the blockchain
   const state = await getChainState()
-  if (!state) return
+  if (!state) { return }
 
   // Get the active block producers
   const producers = await getActiveProducers()
-  if (!producers) return
+  if (!producers) { return }
 
   // Get the current producer schedule
   const schedule = await getProducerSchedule()
-  if (!schedule) return
-  
-  _.each(producersTracking, async (producerTracking) {
-    await checkProducer(producerTracking, state, producers, schedule);
-  });
+  if (!schedule) { return }
+
+  _.each(producersTracking, async (producerTracking) => {
+    await checkProducer(producerTracking, state, producers, schedule)
+  })
 
   const rounds_missed = _.reduce(producersTracking, (sum, {rounds_missed}) => sum + rounds_missed, 0)
   // If the new missed rounds exceeds the threshold, begin taking action
@@ -253,17 +231,17 @@ export async function check() {
     // If keys exist, failover to one of them
     if (producer_signing_pubkeys_nodes.length) {
       const producer_signing_pubkeys = producer_signing_pubkeys_nodes.shift()
-      _.each(producer_signing_pubkeys, async (next_signing_key, i) {
-        const producerTracking = producersTracking[i];
+      _.each(producer_signing_pubkeys, async (next_signing_key, i) => {
+        const producerTracking = producersTracking[i]
         const txid = await failover(producerTracking.producer_account, next_signing_key)
         logger.info({ txid, producer_account: producerTracking.producer_account, next_signing_key }, 'regproducer submitted to failover to next available node')
         slack.send(`⚠️ regproducer submitted with new signing key for ${producerTracking.producer_account} with ${next_signing_key}, ${producer_signing_pubkeys_nodes} keys remaining in rotation (${txid})`)
       })
     } else {
-      // If no public keys exist, crash the app and attempt a reload of public keys in order to start over.
-      logger.info({ txid }, 'no keys, crashing app')
-      slack.send(`⚠️ producers have no backup keys available, crashing the app to try over`)
-      ensureExit();
+      // If no public keys exist, attempt a reload of public keys in order to start over.
+      logger.info('no more keys, restarting with original key rotation config')
+      producer_signing_pubkeys_nodes = (config.get('producer_signing_pubkeys_nodes') as string[][]).slice()
+      slack.send(`⚠️ producers have no backup keys available, restarting with original key rotation config`)
     }
   }
 }

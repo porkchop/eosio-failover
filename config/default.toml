@@ -26,7 +26,7 @@ producer_website = 'https://eos.io'
 producer_location = 0
 
 # A list of potential signing public keys to attempt failover with (any number)
-producer_signing_pubkeys = ['EOS7RZ8MNqgHarNJuwSaSa8VXFkTa2jie17R82uNWcCcta8sM1fah', 'EOS5o13ANoWwfZiTzSaT1ifToQ2mg1RXURcybbuEQbjJ2V9UMFUfT']
+producer_signing_pubkeys_nodes = [['EOS7RZ8MNqgHarNJuwSaSa8VXFkTa2jie17R82uNWcCcta8sM1fah'], ['EOS5o13ANoWwfZiTzSaT1ifToQ2mg1RXURcybbuEQbjJ2V9UMFUfT']]
 
 # slack notifier on activity
 # slack = { url = '', channel = '', chain = '' }
