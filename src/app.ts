@@ -1,9 +1,14 @@
+import * as program from 'commander'
 import * as config from 'config'
 import { Api, JsonRpc } from 'eosjs'
 import { JsSignatureProvider } from 'eosjs/dist/eosjs-jssig'
 import * as _ from 'lodash'
 import { logger, slack } from './common'
 import version from './version'
+
+program
+  .option('-s, --setkeys', 'Forcefully set the producers with a unique signing key from the first key block set in the configuration producer_signing_pubkeys_nodes field')
+  .parse(process.argv)
 
 const fetch = require('node-fetch')
 const util = require('util')
@@ -25,7 +30,8 @@ const producer_website: string = config.get('producer_website')
 const producer_location: number = config.get('producer_location')
 let producer_signing_pubkeys_nodes: string[][] = (config.get('producer_signing_pubkeys_nodes') as string[][]).slice()
 
-const rounds_missed_threshold: number = config.has('rounds_missed_threshold') ? config.get('rounds_missed_threshold') : 1
+const rounds_missed_threshold: number = config.has('rounds_missed_threshold')
+  ? config.get('rounds_missed_threshold') : 1
 const total_producers: number = config.has('total_producers') ? config.get('total_producers') : 21
 const round_timer: number = (config.has('round_timer') ? Number(config.get('round_timer')) : 126) * 1000
 
@@ -96,12 +102,21 @@ export function incomingSigningKeyChange(
   state: string
 ): boolean {
   if (schedule[state] && schedule[state].producers) {
-    const schedule_for_producer = _.find(schedule[state].producers, { producer_name: producerTracking.producer_account })
+    const schedule_for_producer = _.find(schedule[state].producers,
+      { producer_name: producerTracking.producer_account }
+    )
     if (schedule_for_producer) {
       const scheduled_new_key = schedule_for_producer.block_signing_key
-      if (undefined !== producer_signing_pubkeys_nodes.find((producer_signing_pubkeys) => producer_signing_pubkeys.includes(scheduled_new_key))) {
-        logger.debug({ producer_signing_pubkeys_nodes, current_signing_key }, `removing ${state} producer key from potential failover keys`)
-        producer_signing_pubkeys_nodes = _.filter(producer_signing_pubkeys_nodes, (producer_signing_pubkeys) => !producer_signing_pubkeys.includes(scheduled_new_key))
+      // Search through the valid key blocks per node being monitored for this scheduled_new_key
+      if (undefined !== producer_signing_pubkeys_nodes.find(
+        (producer_signing_pubkeys) => producer_signing_pubkeys.includes(scheduled_new_key)
+      )) {
+        // This producer is already using a key we have in our rotation. Clear it and associated ones from rotation...
+        logger.debug({ producer_signing_pubkeys_nodes, current_signing_key }, `removing ${state} producer keys block from potential failover keys`)
+        // Remove all the keys for the block of keys (== subarray of keys) that this one belongs to
+        producer_signing_pubkeys_nodes = _.filter(producer_signing_pubkeys_nodes,
+          (producer_signing_pubkeys) => !producer_signing_pubkeys.includes(scheduled_new_key)
+        )
       }
       if (scheduled_new_key !== current_signing_key) {
         logger.debug({ scheduled_new_key, current_signing_key }, `${state} schedule change found, awaiting...`)
@@ -156,9 +171,13 @@ async function checkProducer(producerTracking: any, state: any, producers: any, 
   const current_signing_key = current_schedule.block_signing_key
 
   // Ensure the current key in use is not a potential key to failover to
-  if (_.find(producer_signing_pubkeys_nodes, (producer_signing_pubkeys) => producer_signing_pubkeys.includes(current_signing_key))) {
+  if (_.find(producer_signing_pubkeys_nodes,
+    (producer_signing_pubkeys) => producer_signing_pubkeys.includes(current_signing_key))
+  ) {
     logger.debug({ producer_signing_pubkeys_nodes, current_signing_key }, 'removing current signing key set from potential failover keys')
-    producer_signing_pubkeys_nodes = _.filter(producer_signing_pubkeys_nodes, (producer_signing_pubkeys) => !producer_signing_pubkeys.includes(current_signing_key))
+    producer_signing_pubkeys_nodes = _.filter(producer_signing_pubkeys_nodes,
+      (producer_signing_pubkeys) => !producer_signing_pubkeys.includes(current_signing_key)
+    )
   }
 
   // If a key change is in progress, do not proceed
@@ -201,8 +220,30 @@ async function checkProducer(producerTracking: any, state: any, producers: any, 
   } else if (unpaid_blocks === producerTracking.last_unpaid) {
     // If the unpaid blocks is the same as the last time - no new blocks have been produced
     producerTracking.rounds_missed += 1
-    logger.info({ last_unpaid: producerTracking.last_unpaid, unpaid_blocks, rounds_missed: producerTracking.rounds_missed }, `producer missed a round!`)
+    logger.info({
+        last_unpaid: producerTracking.last_unpaid, unpaid_blocks,
+        rounds_missed: producerTracking.rounds_missed
+      }, `producer missed a round!`)
     slack.send(`⚠️ producer missed a round ${producerTracking.rounds_missed}/${rounds_missed_threshold}`)
+  }
+}
+
+async function full_failover() {
+  if (!producer_signing_pubkeys_nodes.length) {
+    // If no public keys exist, attempt a reload of public keys in order to start over.
+    logger.info('no more keys, restarting with original key rotation config')
+    producer_signing_pubkeys_nodes = (config.get('producer_signing_pubkeys_nodes') as string[][]).slice()
+    slack.send(`⚠️ producers have no backup keys available, restarting with original key rotation config`)
+  }
+  if (producer_signing_pubkeys_nodes.length) {
+    // Get a new producers key block and assign a key from it to each producer
+    const producer_signing_pubkeys = producer_signing_pubkeys_nodes.shift()
+    _.each(producer_signing_pubkeys, async (next_signing_key, i) => {
+      const producerTracking = producersTracking[i]
+      const txid = await failover(producerTracking.producer_account, next_signing_key)
+      logger.info({ txid, producer_account: producerTracking.producer_account, next_signing_key }, 'regproducer submitted to failover to next available node')
+      slack.send(`⚠️ regproducer submitted with new signing key for ${producerTracking.producer_account} with ${next_signing_key}, ${producer_signing_pubkeys_nodes} keys remaining in rotation (${txid})`)
+    })
   }
 }
 
@@ -223,30 +264,35 @@ export async function check() {
     await checkProducer(producerTracking, state, producers, schedule)
   })
 
-  const rounds_missed = _.reduce(producersTracking, (sum, {rounds_missed}) => sum + rounds_missed, 0)
+  const rounds_missed = _.reduce(producersTracking, (sum, {_rounds_missed}) => sum + _rounds_missed, 0)
   // If the new missed rounds exceeds the threshold, begin taking action
   if (rounds_missed >= rounds_missed_threshold) {
     logger.debug({ rounds_missed, rounds_missed_threshold }, 'producers have exceeded missed round threshold, executing failover')
     slack.send(`⚠️ producers exceeded missed round threshold ${rounds_missed}/${rounds_missed_threshold}`)
     // If keys exist, failover to one of them
-    if (producer_signing_pubkeys_nodes.length) {
-      const producer_signing_pubkeys = producer_signing_pubkeys_nodes.shift()
-      _.each(producer_signing_pubkeys, async (next_signing_key, i) => {
-        const producerTracking = producersTracking[i]
-        const txid = await failover(producerTracking.producer_account, next_signing_key)
-        logger.info({ txid, producer_account: producerTracking.producer_account, next_signing_key }, 'regproducer submitted to failover to next available node')
-        slack.send(`⚠️ regproducer submitted with new signing key for ${producerTracking.producer_account} with ${next_signing_key}, ${producer_signing_pubkeys_nodes} keys remaining in rotation (${txid})`)
-      })
-    } else {
-      // If no public keys exist, attempt a reload of public keys in order to start over.
-      logger.info('no more keys, restarting with original key rotation config')
-      producer_signing_pubkeys_nodes = (config.get('producer_signing_pubkeys_nodes') as string[][]).slice()
-      slack.send(`⚠️ producers have no backup keys available, restarting with original key rotation config`)
-    }
+    await full_failover()
   }
 }
 
+function checkConfig() {
+  // Make sure the public key blocks are the same length as the producer accounts being monitored.
+  // Ie we can assign a unique key for each producer account whenever we failover
+  if (_.find(producer_signing_pubkeys_nodes, (producer_signing_pubkeys) =>
+      producer_signing_pubkeys.length !== producer_accounts.length)
+  ) {
+    logger.error({producer_signing_pubkeys_nodes, producer_accounts}, `producer signing public key blocks in producer_signing_pubkeys_nodes must have the same number of public keys as there are producer_accounts`)
+    return false
+  }
+  return true
+}
+
 export async function main() {
+  if (!checkConfig()) {
+    return ensureExit(1)
+  }
+  if (program.setkeys) {
+    return await full_failover()
+  }
   // Initialize with a first check
   check()
   // Run the check on a set interval based on the length of a round
